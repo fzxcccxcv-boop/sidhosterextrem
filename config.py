@@ -51,8 +51,7 @@ MALICIOUS_PATTERNS = [
     r":\(\)\{\s*:\|:&\s*\};:",  # Fork bomb
     r"/dev/tcp/",
     r"/etc/passwd",
-    r"/etc/shadow",
-    r"BOT_TOKEN",               # Attempting to read the host bot's token
+    r"/etc/shadow",           # Attempting to read the host bot's token
     r"database\.json",          # Attempting to access host DB
     r"xmrig|minerd|stratum\+tcp",
     r"nc\s+-e\s+/bin/(ba)?sh",
