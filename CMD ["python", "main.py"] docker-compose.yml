@@ -1,0 +1,17 @@
+services:
+  telegram-hoster-bot:
+    build: .
+    container_name: telegram_hoster_bot
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - OWNER_ID=${OWNER_ID}
+    volumes:
+      - ./workspaces:/app/workspaces
+      - ./database.json:/app/database.json
+    # Optional resource guardrails for the entire container
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
