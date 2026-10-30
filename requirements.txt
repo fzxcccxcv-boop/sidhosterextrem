@@ -1,4 +1,4 @@
-pyTelegramBotAPI==4.22.1
+pyTelegramBotAPI>=4.37.0
 psutil==6.0.0
 requests==2.32.3
 Pillow
