@@ -1,10 +1,14 @@
 import os
+import io
+import json
 import uuid
 import time
 import shutil
+import zipfile
 import psutil
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
+from PIL import Image, ImageDraw, ImageFont
 
 from config import (
     BOT_TOKEN,
@@ -19,6 +23,166 @@ from security_scanner import SecurityScanner
 from process_manager import pm
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
+
+# ==========================================
+# PERMANENT DATA & SYSTEM MIGRATION HELPERS
+# ==========================================
+PERMA_DATA_FILE = "perma_data.json"
+
+
+def load_perma_data() -> dict:
+    if not os.path.exists(PERMA_DATA_FILE):
+        default_data = {
+            "users": {},
+            "menu_media": {"type": None, "file_id": None},
+            "db_snapshot": {}
+        }
+        save_perma_data(default_data)
+        return default_data
+    try:
+        with open(PERMA_DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"users": {}, "menu_media": {"type": None, "file_id": None}, "db_snapshot": {}}
+
+
+def save_perma_data(data: dict):
+    try:
+        with open(PERMA_DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def sync_to_perma_data(user=None):
+    """Saves user join data and full DB snapshot into perma_data.json."""
+    pdata = load_perma_data()
+    if user:
+        uid = str(user.id)
+        pdata.setdefault("users", {})[uid] = {
+            "user_id": user.id,
+            "username": user.username or "",
+            "first_name": user.first_name or "User",
+            "synced_at": int(time.time())
+        }
+    try:
+        from config import DB_FILE_PATH
+        if os.path.exists(DB_FILE_PATH):
+            with open(DB_FILE_PATH, "r", encoding="utf-8") as dbf:
+                pdata["db_snapshot"] = json.load(dbf)
+    except Exception:
+        pass
+    save_perma_data(pdata)
+
+
+def auto_sync_perma_on_boot():
+    """Automatically restores users, workspaces, and DB records when changing systems."""
+    pdata = load_perma_data()
+    db_snap = pdata.get("db_snapshot", {})
+    try:
+        from config import DB_FILE_PATH
+        if db_snap and not os.path.exists(DB_FILE_PATH):
+            with open(DB_FILE_PATH, "w", encoding="utf-8") as dbf:
+                json.dump(db_snap, dbf, indent=4, ensure_ascii=False)
+    except Exception:
+        pass
+
+    for uid, uinfo in pdata.get("users", {}).items():
+        try:
+            uid_int = int(uid)
+            db.register_user(uid_int, uinfo.get("username", ""), uinfo.get("first_name", "User"))
+            pm.get_user_workspace(uid_int)
+        except Exception:
+            pass
+
+
+def create_user_welcome_frame(user) -> io.BytesIO:
+    """Generates a small welcome card showing the user's PFP, Username, and User ID."""
+    width, height = 520, 190
+    card = Image.new("RGBA", (width, height), (14, 18, 26, 255))
+    draw = ImageDraw.Draw(card)
+
+    # Outer & inner frame borders
+    draw.rounded_rectangle([(5, 5), (width - 5, height - 5)], radius=18, outline=(0, 229, 255, 255), width=3)
+    draw.rounded_rectangle([(12, 12), (width - 12, height - 12)], radius=14, fill=(22, 28, 40, 255))
+
+    pfp_img = None
+    try:
+        photos = bot.get_user_profile_photos(user.id, limit=1)
+        if photos.total_count > 0:
+            file_id = photos.photos[0][-1].file_id
+            file_info = bot.get_file(file_id)
+            downloaded = bot.download_file(file_info.file_path)
+            pfp_img = Image.open(io.BytesIO(downloaded)).convert("RGBA")
+    except Exception:
+        pfp_img = None
+
+    pfp_size = 115
+    if pfp_img is None:
+        pfp_img = Image.new("RGBA", (pfp_size, pfp_size), (0, 140, 255, 255))
+    else:
+        pfp_img = pfp_img.resize((pfp_size, pfp_size), Image.Resampling.LANCZOS)
+
+    mask = Image.new("L", (pfp_size, pfp_size), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.ellipse((0, 0, pfp_size, pfp_size), fill=255)
+
+    pfp_x, pfp_y = 32, 37
+    card.paste(pfp_img, (pfp_x, pfp_y), mask)
+    draw.ellipse((pfp_x - 3, pfp_y - 3, pfp_x + pfp_size + 3, pfp_y + pfp_size + 3), outline=(0, 255, 136, 255), width=3)
+
+    font = ImageFont.load_default()
+    uname = f"@{user.username}" if user.username else "No Username"
+    fname = (user.first_name or "User")[:24]
+
+    draw.text((170, 42), "🟢 USER PROFILE FRAME", fill=(0, 229, 255, 255), font=font)
+    draw.text((170, 74), f"Name     : {fname}", fill=(255, 255, 255, 255), font=font)
+    draw.text((170, 102), f"Username : {uname[:24]}", fill=(180, 205, 230, 255), font=font)
+    draw.text((170, 130), f"User ID  : {user.id}", fill=(0, 255, 136, 255), font=font)
+
+    bio = io.BytesIO()
+    card.convert("RGB").save(bio, format="JPEG", quality=92)
+    bio.seek(0)
+    return bio
+
+
+def send_dashboard_message(chat_id: int, text: str, reply_markup: InlineKeyboardMarkup):
+    """Sends the upper video (with volume ON) or photo frame if configured by owner, else text."""
+    pdata = load_perma_data()
+    media = pdata.get("menu_media", {})
+    m_type = media.get("type")
+    m_fid = media.get("file_id")
+
+    try:
+        if m_type == "video" and m_fid:
+            return bot.send_video(
+                chat_id,
+                video=m_fid,
+                caption=text,
+                reply_markup=reply_markup,
+                supports_streaming=True
+            )
+        elif m_type == "photo" and m_fid:
+            return bot.send_photo(
+                chat_id,
+                photo=m_fid,
+                caption=text,
+                reply_markup=reply_markup
+            )
+    except Exception:
+        pass
+    return bot.send_message(chat_id, text, reply_markup=reply_markup)
+
+
+def safe_edit_message(text: str, chat_id: int, message_id: int, reply_markup: InlineKeyboardMarkup = None):
+    """Safely edits either a media caption (when upper video/photo is active) or a standard text message."""
+    try:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup)
+    except Exception:
+        try:
+            bot.edit_message_caption(caption=text, chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+        except Exception:
+            bot.send_message(chat_id, text, reply_markup=reply_markup)
 
 
 # ==========================================
@@ -45,8 +209,8 @@ def notify_user_on_crash(user_id: int, file_id: str, file_name: str, exit_code: 
     )
     markup = InlineKeyboardMarkup()
     markup.row(
-        InlineKeyboardButton("🔄 Restart Now", callback_data=f"file_start:{file_id}"),
-        InlineKeyboardButton("📜 Full Logs", callback_data=f"file_logs:{file_id}")
+        InlineKeyboardButton("🟢 🔄 Restart Now", callback_data=f"file_start:{file_id}"),
+        InlineKeyboardButton("🔵 📜 Full Logs", callback_data=f"file_logs:{file_id}")
     )
     try:
         bot.send_message(user_id, text, reply_markup=markup)
@@ -55,20 +219,20 @@ def notify_user_on_crash(user_id: int, file_id: str, file_name: str, exit_code: 
 
 
 # ==========================================
-# KEYBOARD BUILDERS
+# KEYBOARD BUILDERS (GREEN / RED / BLUE)
 # ==========================================
 def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
-        InlineKeyboardButton("📤 Upload (.py / .zip)", callback_data="menu_upload"),
-        InlineKeyboardButton("⚡ Auto-Host (GitHub)", callback_data="menu_github"),
-        InlineKeyboardButton("📁 File Records", callback_data="menu_files"),
+        InlineKeyboardButton("🟢 📤 Upload (.py / .zip)", callback_data="menu_upload"),
+        InlineKeyboardButton("🔵 ⚡ Auto-Host (GitHub)", callback_data="menu_github"),
+        InlineKeyboardButton("🔵 📁 File Records", callback_data="menu_files"),
         InlineKeyboardButton("🟢 Active Sessions", callback_data="menu_sessions"),
-        InlineKeyboardButton("💻 Terminal (Pip)", callback_data="menu_terminal"),
-        InlineKeyboardButton("⚙️ Settings & Env", callback_data="menu_settings")
+        InlineKeyboardButton("🔵 💻 Terminal (Pip)", callback_data="menu_terminal"),
+        InlineKeyboardButton("🔴 ⚙️ Settings & Env", callback_data="menu_settings")
     )
     if user_id in ADMIN_IDS:
-        markup.add(InlineKeyboardButton("👑 Owner Control Panel", callback_data="owner_panel"))
+        markup.add(InlineKeyboardButton("🔴 👑 Owner Control Panel", callback_data="owner_panel"))
     return markup
 
 
@@ -80,23 +244,23 @@ def file_control_keyboard(file_id: str) -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup(row_width=2)
     if running:
         markup.add(
-            InlineKeyboardButton("🛑 Stop Process", callback_data=f"file_stop:{file_id}"),
-            InlineKeyboardButton("🔄 Restart", callback_data=f"file_restart:{file_id}")
+            InlineKeyboardButton("🔴 🛑 Stop Process", callback_data=f"file_stop:{file_id}"),
+            InlineKeyboardButton("🔵 🔄 Restart", callback_data=f"file_restart:{file_id}")
         )
     else:
         markup.add(
-            InlineKeyboardButton("▶️ Start Hosting", callback_data=f"file_start:{file_id}"),
-            InlineKeyboardButton("📦 Check / Install Reqs", callback_data=f"file_reqs:{file_id}")
+            InlineKeyboardButton("🟢 ▶️ Start Hosting", callback_data=f"file_start:{file_id}"),
+            InlineKeyboardButton("🔵 📦 Check / Install Reqs", callback_data=f"file_reqs:{file_id}")
         )
 
     if len(entrypoints) > 1:
-        markup.add(InlineKeyboardButton("🔀 Switch Entry File (.py)", callback_data=f"file_entry_menu:{file_id}"))
+        markup.add(InlineKeyboardButton("🔵 🔀 Switch Entry File (.py)", callback_data=f"file_entry_menu:{file_id}"))
 
     markup.add(
-        InlineKeyboardButton("📜 Live Terminal Logs", callback_data=f"file_logs:{file_id}"),
-        InlineKeyboardButton("🛡️ Rescan Security", callback_data=f"file_scan:{file_id}"),
-        InlineKeyboardButton("🗑️ Delete Project", callback_data=f"file_delete:{file_id}"),
-        InlineKeyboardButton("🔙 Back to Files", callback_data="menu_files")
+        InlineKeyboardButton("🔵 📜 Live Terminal Logs", callback_data=f"file_logs:{file_id}"),
+        InlineKeyboardButton("🟢 🛡️ Rescan Security", callback_data=f"file_scan:{file_id}"),
+        InlineKeyboardButton("🔴 🗑️ Delete Project", callback_data=f"file_delete:{file_id}"),
+        InlineKeyboardButton("🔵 🔙 Back to Files", callback_data="menu_files")
     )
     return markup
 
@@ -104,18 +268,18 @@ def file_control_keyboard(file_id: str) -> InlineKeyboardMarkup:
 def settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
     user = db.get_user(user_id) or {}
     settings = user.get("settings", {})
-    auto_restart = "✅ ON" if settings.get("auto_restart_on_crash") else "❌ OFF"
-    crash_notify = "✅ ON" if settings.get("notify_on_crash", True) else "❌ OFF"
-    auto_scan = "✅ ON" if settings.get("auto_scan_imports", True) else "❌ OFF"
+    auto_restart = "🟢 ON" if settings.get("auto_restart_on_crash") else "🔴 OFF"
+    crash_notify = "🟢 ON" if settings.get("notify_on_crash", True) else "🔴 OFF"
+    auto_scan = "🟢 ON" if settings.get("auto_scan_imports", True) else "🔴 OFF"
 
     markup = InlineKeyboardMarkup(row_width=1)
     markup.add(
         InlineKeyboardButton(f"🔄 Auto-Restart on Crash: {auto_restart}", callback_data="toggle_setting:auto_restart_on_crash"),
         InlineKeyboardButton(f"🔔 Crash Traceback Alerts: {crash_notify}", callback_data="toggle_setting:notify_on_crash"),
         InlineKeyboardButton(f"🔍 Auto-Check Imports on Upload: {auto_scan}", callback_data="toggle_setting:auto_scan_imports"),
-        InlineKeyboardButton("🔐 Add Environment Variable (KEY=VALUE)", callback_data="env_add"),
-        InlineKeyboardButton("🧹 Clear All Environment Variables", callback_data="env_clear"),
-        InlineKeyboardButton("🔙 Main Menu", callback_data="menu_home")
+        InlineKeyboardButton("🔵 🔐 Add Environment Variable (KEY=VALUE)", callback_data="env_add"),
+        InlineKeyboardButton("🔴 🧹 Clear All Environment Variables", callback_data="env_clear"),
+        InlineKeyboardButton("🟢 🔙 Main Menu", callback_data="menu_home")
     )
     return markup
 
@@ -123,14 +287,17 @@ def settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
 def owner_panel_keyboard() -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup(row_width=2)
     markup.add(
-        InlineKeyboardButton("📊 Server Telemetry", callback_data="owner_stats"),
-        InlineKeyboardButton("🔥 All Active Processes", callback_data="owner_processes"),
-        InlineKeyboardButton("👥 User Directory", callback_data="owner_users"),
-        InlineKeyboardButton("🛑 Kill All Processes", callback_data="owner_killall"),
-        InlineKeyboardButton("🚫 Ban / Unban User", callback_data="owner_ban_prompt"),
-        InlineKeyboardButton("📢 Broadcast Message", callback_data="owner_broadcast"),
-        InlineKeyboardButton("💾 Export Database JSON", callback_data="owner_export_db"),
-        InlineKeyboardButton("🔙 Main Menu", callback_data="menu_home")
+        InlineKeyboardButton("🔵 📊 Server Telemetry", callback_data="owner_stats"),
+        InlineKeyboardButton("🟢 🔥 All Active Processes", callback_data="owner_processes"),
+        InlineKeyboardButton("🔵 👥 User Directory", callback_data="owner_users"),
+        InlineKeyboardButton("🔴 🛑 Kill All Processes", callback_data="owner_killall"),
+        InlineKeyboardButton("🔴 🚫 Ban / Unban User", callback_data="owner_ban_prompt"),
+        InlineKeyboardButton("🔵 📢 Broadcast Message", callback_data="owner_broadcast"),
+        InlineKeyboardButton("🟢 📦 Download All Files", callback_data="owner_download_all_files"),
+        InlineKeyboardButton("🔵 🎬 Set Menu Video/Photo", callback_data="owner_set_media"),
+        InlineKeyboardButton("🟢 💾 Export Database JSON", callback_data="owner_export_db"),
+        InlineKeyboardButton("🔵 🔄 Restore Perma Backup", callback_data="owner_restore_perma"),
+        InlineKeyboardButton("🔴 🔙 Main Menu", callback_data="menu_home")
     )
     return markup
 
@@ -147,6 +314,25 @@ def cmd_start(message: Message):
 
     db.register_user(user_id, message.from_user.username, message.from_user.first_name)
     db.set_user_state(user_id, "IDLE")
+    sync_to_perma_data(message.from_user)
+
+    # 1. Send Small User PFP Frame showing PFP, Username & User ID
+    try:
+        card_bio = create_user_welcome_frame(message.from_user)
+        uname_disp = f"@{message.from_user.username}" if message.from_user.username else "No Username"
+        bot.send_photo(
+            message.chat.id,
+            photo=card_bio,
+            caption=(
+                f"🖼️ *User Profile Frame*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 *Name:* `{message.from_user.first_name}`\n"
+                f"🔗 *Username:* `{uname_disp}`\n"
+                f"🆔 *User ID:* `{user_id}`"
+            )
+        )
+    except Exception:
+        pass
 
     user_files = db.get_user_files(user_id)
     active_sessions = db.get_user_sessions(user_id)
@@ -164,7 +350,8 @@ def cmd_start(message: Message):
         f"• Automatic `.zip` & GitHub deployment with live error reporting\n\n"
         f"👇 *Select an operation from the control dashboard below:*"
     )
-    bot.send_message(message.chat.id, welcome_text, reply_markup=main_menu_keyboard(user_id))
+    # 2. Send Menu with Upper Video (Volume ON) or Photo if set by Owner
+    send_dashboard_message(message.chat.id, welcome_text, reply_markup=main_menu_keyboard(user_id))
 
 
 @bot.message_handler(commands=["terminal", "pip"])
@@ -174,7 +361,7 @@ def cmd_terminal(message: Message):
         return
     db.set_user_state(user_id, "TERMINAL_PIP")
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🔙 Exit Terminal", callback_data="menu_home"))
+    markup.add(InlineKeyboardButton("🔴 🔙 Exit Terminal", callback_data="menu_home"))
     bot.reply_to(
         message,
         "💻 *Interactive Pip Terminal Activated*\n"
@@ -195,7 +382,7 @@ def cmd_autohost(message: Message):
         return
     db.set_user_state(user_id, "AWAITING_GITHUB_URL")
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="menu_home"))
+    markup.add(InlineKeyboardButton("🔴 🔙 Cancel", callback_data="menu_home"))
     bot.reply_to(
         message,
         "⚡ *GitHub Auto-Hoster*\n"
@@ -219,6 +406,39 @@ def cmd_owner(message: Message):
 
 
 # ==========================================
+# OWNER MEDIA HANDLER (VIDEO / PHOTO FOR MENU)
+# ==========================================
+@bot.message_handler(content_types=["video", "photo"])
+def handle_owner_media_upload(message: Message):
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    user = db.get_user(user_id) or {}
+    if user.get("state") != "OWNER_AWAITING_MEDIA":
+        return
+
+    pdata = load_perma_data()
+    if message.content_type == "video":
+        pdata["menu_media"] = {"type": "video", "file_id": message.video.file_id}
+        save_perma_data(pdata)
+        db.set_user_state(user_id, "IDLE")
+        bot.reply_to(
+            message,
+            "🟢 ✅ *Upper Menu Video Saved!* When users start the bot, they will now see this video with volume ON.",
+            reply_markup=owner_panel_keyboard()
+        )
+    elif message.content_type == "photo":
+        pdata["menu_media"] = {"type": "photo", "file_id": message.photo[-1].file_id}
+        save_perma_data(pdata)
+        db.set_user_state(user_id, "IDLE")
+        bot.reply_to(
+            message,
+            "🟢 ✅ *Upper Menu Photo Saved!* When users start the bot, they will now see this photo in the upper frame.",
+            reply_markup=owner_panel_keyboard()
+        )
+
+
+# ==========================================
 # DOCUMENT UPLOAD HANDLER (.py, .zip, requirements.txt)
 # ==========================================
 @bot.message_handler(content_types=["document"])
@@ -228,9 +448,41 @@ def handle_document_upload(message: Message):
         bot.reply_to(message, "🚫 You are banned from using this hoster.")
         return
 
-    db.register_user(user_id, message.from_user.username, message.from_user.first_name)
+    user_obj = db.register_user(user_id, message.from_user.username, message.from_user.first_name)
+    sync_to_perma_data(message.from_user)
     doc = message.document
     file_name = doc.file_name or "script.py"
+
+    # Handle Owner Restoring Perma Backup (.json or full backup .zip)
+    if user_id in ADMIN_IDS and user_obj.get("state") == "OWNER_AWAITING_PERMA_RESTORE":
+        db.set_user_state(user_id, "IDLE")
+        file_info = bot.get_file(doc.file_id)
+        downloaded = bot.download_file(file_info.file_path)
+
+        if file_name.lower().endswith(".json"):
+            with open(PERMA_DATA_FILE, "wb") as f:
+                f.write(downloaded)
+            auto_sync_perma_on_boot()
+            bot.reply_to(
+                message,
+                "🟢 ✅ *Perma Data JSON Restored!* All users and database records have been synced to this system.",
+                reply_markup=owner_panel_keyboard()
+            )
+            return
+        elif file_name.lower().endswith(".zip"):
+            tmp_restore = "temp_system_restore.zip"
+            with open(tmp_restore, "wb") as f:
+                f.write(downloaded)
+            with zipfile.ZipFile(tmp_restore, "r") as zf:
+                zf.extractall(".")
+            os.remove(tmp_restore)
+            auto_sync_perma_on_boot()
+            bot.reply_to(
+                message,
+                "🟢 ✅ *Full System Backup Restored!* All user files, workspaces, and `perma_data.json` are now live.",
+                reply_markup=owner_panel_keyboard()
+            )
+            return
 
     if doc.file_size and doc.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
         bot.reply_to(message, f"❌ File exceeds maximum upload size limit of `{MAX_FILE_SIZE_MB} MB`.")
@@ -286,7 +538,7 @@ def handle_document_upload(message: Message):
         res = pm.extract_and_prepare_zip(user_id, temp_zip_path, file_name, update_zip_progress)
         if not res["success"]:
             markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🔙 Main Menu", callback_data="menu_home"))
+            markup.add(InlineKeyboardButton("🔴 🔙 Main Menu", callback_data="menu_home"))
             bot.edit_message_text(
                 f"❌ *ZIP Project Deployment Failed*\n━━━━━━━━━━━━━━━━━━━━\n{res['error']}",
                 message.chat.id,
@@ -309,6 +561,7 @@ def handle_document_upload(message: Message):
             available_entrypoints=res["available_entrypoints"]
         )
         db.set_user_state(user_id, "IDLE")
+        sync_to_perma_data(message.from_user)
 
         # Automatically start the extracted project if user has available process slots
         active_sessions = db.get_user_sessions(user_id)
@@ -387,13 +640,14 @@ def handle_document_upload(message: Message):
         scan_status="CLEAN"
     )
     db.set_user_state(user_id, "IDLE")
+    sync_to_perma_data(message.from_user)
 
     reqs_str = ", ".join([f"`{r}`" for r in detected_reqs]) if detected_reqs else "`None (Standard Library only)`"
     missing_str = ", ".join([f"`{r}`" for r in missing_reqs]) if missing_reqs else "`All Installed ✅`"
 
     markup = file_control_keyboard(file_id)
     if missing_reqs:
-        markup.add(InlineKeyboardButton("⚡ Auto-Install Missing Requirements Now", callback_data=f"file_autoinstall:{file_id}"))
+        markup.add(InlineKeyboardButton("🟢 ⚡ Auto-Install Missing Requirements Now", callback_data=f"file_autoinstall:{file_id}"))
 
     bot.edit_message_text(
         f"✅ *File Uploaded & Verified Clean*\n"
@@ -440,8 +694,8 @@ def _install_packages_sequentially(chat_id: int, message_id: int, user_id: int, 
     final_text = f"{final_status}\n━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(results_log)
     markup = InlineKeyboardMarkup()
     markup.add(
-        InlineKeyboardButton("📁 Go to My Files", callback_data="menu_files"),
-        InlineKeyboardButton("🏠 Main Menu", callback_data="menu_home")
+        InlineKeyboardButton("🔵 📁 Go to My Files", callback_data="menu_files"),
+        InlineKeyboardButton("🟢 🏠 Main Menu", callback_data="menu_home")
     )
     try:
         bot.edit_message_text(final_text, chat_id, message_id, reply_markup=markup)
@@ -460,6 +714,7 @@ def handle_text_states(message: Message):
         return
 
     user = db.register_user(user_id, message.from_user.username, message.from_user.first_name)
+    sync_to_perma_data(message.from_user)
     state = user.get("state", "IDLE")
     text = message.text.strip()
 
@@ -492,7 +747,7 @@ def handle_text_states(message: Message):
         res = pm.clone_and_prepare_github(user_id, text, update_progress)
         if not res["success"]:
             markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🔙 Main Menu", callback_data="menu_home"))
+            markup.add(InlineKeyboardButton("🔴 🔙 Main Menu", callback_data="menu_home"))
             bot.edit_message_text(
                 f"❌ *GitHub Auto-Host Failed*\n━━━━━━━━━━━━━━━━━━━━\n{res['error']}",
                 message.chat.id,
@@ -514,6 +769,7 @@ def handle_text_states(message: Message):
             project_dir=res["project_dir"],
             available_entrypoints=res["available_entrypoints"]
         )
+        sync_to_perma_data(message.from_user)
 
         update_progress(f"🚀 Starting `{display_name}` in real-time...")
         pm.start_file(file_id, on_crash_callback=notify_user_on_crash)
@@ -544,6 +800,7 @@ def handle_text_states(message: Message):
         k, v = k.strip(), v.strip()
         db.set_user_env_var(user_id, k, v)
         db.set_user_state(user_id, "IDLE")
+        sync_to_perma_data(message.from_user)
         bot.reply_to(
             message,
             f"✅ Environment variable `{k}` saved! It will be injected into all your hosted scripts.",
@@ -568,6 +825,7 @@ def handle_text_states(message: Message):
             for sess in db.get_user_sessions(target_id):
                 pm.stop_file(sess["file_id"])
             bot.reply_to(message, f"🚫 User `{target_id}` has been *BANNED* and their processes were terminated.", reply_markup=owner_panel_keyboard())
+        sync_to_perma_data()
         return
 
     # 4. OWNER BROADCAST FLOW
@@ -607,7 +865,7 @@ def handle_callbacks(call: CallbackQuery):
         db.set_user_state(user_id, "IDLE")
         user_files = db.get_user_files(user_id)
         active_sessions = db.get_user_sessions(user_id)
-        bot.edit_message_text(
+        safe_edit_message(
             f"⚡ *Cloud Python Hoster Dashboard*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 *User ID:* `{user_id}`\n"
@@ -622,8 +880,8 @@ def handle_callbacks(call: CallbackQuery):
     elif data == "menu_upload":
         db.set_user_state(user_id, "AWAITING_UPLOAD")
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data="menu_home"))
-        bot.edit_message_text(
+        markup.add(InlineKeyboardButton("🔴 🔙 Back", callback_data="menu_home"))
+        safe_edit_message(
             "📤 *Upload Script or Multi-File ZIP Project*\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "Send any of the following as a Telegram document attachment:\n\n"
@@ -638,8 +896,8 @@ def handle_callbacks(call: CallbackQuery):
     elif data == "menu_github":
         db.set_user_state(user_id, "AWAITING_GITHUB_URL")
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data="menu_home"))
-        bot.edit_message_text(
+        markup.add(InlineKeyboardButton("🔴 🔙 Back", callback_data="menu_home"))
+        safe_edit_message(
             "⚡ *Auto-Host GitHub Repository*\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "Send a public GitHub URL (e.g. `https://github.com/user/repo`).\n\n"
@@ -655,8 +913,8 @@ def handle_callbacks(call: CallbackQuery):
         installed = user.get("installed_packages", [])
         recent_pkgs = ", ".join([f"`{p}`" for p in installed[-10:]]) if installed else "`None recorded yet`"
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data="menu_home"))
-        bot.edit_message_text(
+        markup.add(InlineKeyboardButton("🔴 🔙 Back", callback_data="menu_home"))
+        safe_edit_message(
             f"💻 *Interactive Requirement Terminal*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Type and send any `pip install` command directly in chat:\n"
@@ -673,10 +931,10 @@ def handle_callbacks(call: CallbackQuery):
         markup = InlineKeyboardMarkup(row_width=1)
         if not files:
             markup.add(
-                InlineKeyboardButton("📤 Upload First File / ZIP", callback_data="menu_upload"),
-                InlineKeyboardButton("🔙 Main Menu", callback_data="menu_home")
+                InlineKeyboardButton("🟢 📤 Upload First File / ZIP", callback_data="menu_upload"),
+                InlineKeyboardButton("🔴 🔙 Main Menu", callback_data="menu_home")
             )
-            bot.edit_message_text(
+            safe_edit_message(
                 "📁 *Your File & Project Records*\n━━━━━━━━━━━━━━━━━━━━\nYou haven't uploaded any files or `.zip` projects yet.",
                 call.message.chat.id,
                 call.message.message_id,
@@ -692,8 +950,8 @@ def handle_callbacks(call: CallbackQuery):
             markup.add(
                 InlineKeyboardButton(f"{badge} | {src_icon} {f['file_name']} ({fid})", callback_data=f"file_view:{fid}")
             )
-        markup.add(InlineKeyboardButton("🔙 Main Menu", callback_data="menu_home"))
-        bot.edit_message_text(
+        markup.add(InlineKeyboardButton("🔵 🔙 Main Menu", callback_data="menu_home"))
+        safe_edit_message(
             f"📁 *Your Hosted Projects ({len(files)}/{MAX_FILES_PER_USER})*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Select any file or `.zip` project below to start/stop hosting, switch entry points, or view live logs:",
@@ -706,9 +964,9 @@ def handle_callbacks(call: CallbackQuery):
         sessions = db.get_user_sessions(user_id)
         markup = InlineKeyboardMarkup(row_width=1)
         if not sessions:
-            markup.add(InlineKeyboardButton("📁 Start a Project", callback_data="menu_files"))
-            markup.add(InlineKeyboardButton("🔙 Main Menu", callback_data="menu_home"))
-            bot.edit_message_text(
+            markup.add(InlineKeyboardButton("🟢 📁 Start a Project", callback_data="menu_files"))
+            markup.add(InlineKeyboardButton("🔴 🔙 Main Menu", callback_data="menu_home"))
+            safe_edit_message(
                 "🟢 *Active Running Sessions*\n━━━━━━━━━━━━━━━━━━━━\nNo scripts are currently running.",
                 call.message.chat.id,
                 call.message.message_id,
@@ -726,18 +984,18 @@ def handle_callbacks(call: CallbackQuery):
                 f"   ├ PID: `{metrics['pid']}` | Uptime: `{metrics['uptime']}`\n"
                 f"   └ CPU: `{metrics['cpu']}%` | RAM: `{metrics['ram_mb']} MB`"
             )
-            markup.add(InlineKeyboardButton(f"⚙️ Manage {f_rec['file_name']} ({fid})", callback_data=f"file_view:{fid}"))
+            markup.add(InlineKeyboardButton(f"🔵 ⚙️ Manage {f_rec['file_name']} ({fid})", callback_data=f"file_view:{fid}"))
         markup.add(
-            InlineKeyboardButton("🔄 Refresh Metrics", callback_data="menu_sessions"),
-            InlineKeyboardButton("🔙 Main Menu", callback_data="menu_home")
+            InlineKeyboardButton("🟢 🔄 Refresh Metrics", callback_data="menu_sessions"),
+            InlineKeyboardButton("🔴 🔙 Main Menu", callback_data="menu_home")
         )
-        bot.edit_message_text("\n\n".join(lines), call.message.chat.id, call.message.message_id, reply_markup=markup)
+        safe_edit_message("\n\n".join(lines), call.message.chat.id, call.message.message_id, reply_markup=markup)
 
     elif data == "menu_settings":
         user = db.get_user(user_id) or {}
         env_vars = user.get("settings", {}).get("env_vars", {})
         env_display = "\n".join([f"• `{k}` = `{v[:4]}***`" for k, v in env_vars.items()]) if env_vars else "`No custom environment variables set`"
-        bot.edit_message_text(
+        safe_edit_message(
             f"⚙️ *User Hosting Settings & Environment*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔐 *Configured Environment Variables:*\n{env_display}\n\n"
@@ -752,6 +1010,7 @@ def handle_callbacks(call: CallbackQuery):
         user = db.get_user(user_id) or {}
         current = user.get("settings", {}).get(key, False)
         db.update_user_setting(user_id, key, not current)
+        sync_to_perma_data(call.from_user)
         bot.answer_callback_query(call.id, "Setting updated!")
         call.data = "menu_settings"
         handle_callbacks(call)
@@ -759,8 +1018,8 @@ def handle_callbacks(call: CallbackQuery):
     elif data == "env_add":
         db.set_user_state(user_id, "AWAITING_ENV_VAR")
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="menu_settings"))
-        bot.edit_message_text(
+        markup.add(InlineKeyboardButton("🔴 🔙 Cancel", callback_data="menu_settings"))
+        safe_edit_message(
             "🔐 *Add Environment Variable*\n━━━━━━━━━━━━━━━━━━━━\nSend your variable in `KEY=VALUE` format (e.g. `API_ID=987654`).",
             call.message.chat.id,
             call.message.message_id,
@@ -769,6 +1028,7 @@ def handle_callbacks(call: CallbackQuery):
 
     elif data == "env_clear":
         db.clear_user_env_vars(user_id)
+        sync_to_perma_data(call.from_user)
         bot.answer_callback_query(call.id, "All custom environment variables cleared!", show_alert=True)
         call.data = "menu_settings"
         handle_callbacks(call)
@@ -786,9 +1046,9 @@ def handle_callbacks(call: CallbackQuery):
         entrypoints = f_rec.get("available_entrypoints", [])
         markup = InlineKeyboardMarkup(row_width=1)
         for idx, ep in enumerate(entrypoints):
-            markup.add(InlineKeyboardButton(f"🎯 Set Entry: {ep}", callback_data=f"file_set_entry:{fid}:{idx}"))
-        markup.add(InlineKeyboardButton("🔙 Back to Project", callback_data=f"file_view:{fid}"))
-        bot.edit_message_text(
+            markup.add(InlineKeyboardButton(f"🟢 🎯 Set Entry: {ep}", callback_data=f"file_set_entry:{fid}:{idx}"))
+        markup.add(InlineKeyboardButton("🔴 🔙 Back to Project", callback_data=f"file_view:{fid}"))
+        safe_edit_message(
             f"🔀 *Select Entry Point File*\n━━━━━━━━━━━━━━━━━━━━\nChoose which `.py` script should be executed when starting `{f_rec['file_name']}`:",
             call.message.chat.id,
             call.message.message_id,
@@ -808,6 +1068,7 @@ def handle_callbacks(call: CallbackQuery):
             if was_running:
                 pm.stop_file(fid)
             db.update_file_entrypoint(fid, new_entry)
+            sync_to_perma_data(call.from_user)
             if was_running:
                 pm.start_file(fid, on_crash_callback=notify_user_on_crash)
             bot.answer_callback_query(call.id, f"Entry point updated to {new_entry}!")
@@ -850,10 +1111,10 @@ def handle_callbacks(call: CallbackQuery):
         logs = pm.read_logs(fid, lines=35)
         markup = InlineKeyboardMarkup(row_width=2)
         markup.add(
-            InlineKeyboardButton("🔄 Refresh Logs", callback_data=f"file_logs:{fid}"),
-            InlineKeyboardButton("🔙 Back to File", callback_data=f"file_view:{fid}")
+            InlineKeyboardButton("🟢 🔄 Refresh Logs", callback_data=f"file_logs:{fid}"),
+            InlineKeyboardButton("🔵 🔙 Back to File", callback_data=f"file_view:{fid}")
         )
-        bot.edit_message_text(
+        safe_edit_message(
             f"📜 *Live Console Output:* `{f_rec['file_name']}`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"```text\n{logs}\n```",
@@ -871,12 +1132,12 @@ def handle_callbacks(call: CallbackQuery):
         missing = pm.check_missing_requirements(reqs)
         markup = InlineKeyboardMarkup(row_width=1)
         if missing:
-            markup.add(InlineKeyboardButton("⚡ Install Missing Packages One-by-One", callback_data=f"file_autoinstall:{fid}"))
+            markup.add(InlineKeyboardButton("🟢 ⚡ Install Missing Packages One-by-One", callback_data=f"file_autoinstall:{fid}"))
         if reqs:
-            markup.add(InlineKeyboardButton("🔄 Force Reinstall All Detected Packages", callback_data=f"file_forceinstall:{fid}"))
-        markup.add(InlineKeyboardButton("🔙 Back to Project", callback_data=f"file_view:{fid}"))
+            markup.add(InlineKeyboardButton("🔵 🔄 Force Reinstall All Detected Packages", callback_data=f"file_forceinstall:{fid}"))
+        markup.add(InlineKeyboardButton("🔴 🔙 Back to Project", callback_data=f"file_view:{fid}"))
 
-        bot.edit_message_text(
+        safe_edit_message(
             f"📦 *Dependency Inspector:* `{f_rec['file_name']}`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"• *Detected Packages:* {', '.join([f'`{r}`' for r in reqs]) if reqs else '`None`'}\n"
@@ -924,6 +1185,7 @@ def handle_callbacks(call: CallbackQuery):
             except Exception:
                 pass
         db.delete_file_record(fid)
+        sync_to_perma_data(call.from_user)
         bot.answer_callback_query(call.id, "🗑️ Project and logs deleted.")
         call.data = "menu_files"
         handle_callbacks(call)
@@ -959,22 +1221,19 @@ def _render_file_details(call: CallbackQuery, file_id: str):
         f"• *Missing Reqs:* `{len(missing)}` package(s)\n"
         f"• *Last Exit Code:* `{f_rec.get('last_exit_code', 'N/A')}`"
     )
-    try:
-        bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=file_control_keyboard(file_id)
-        )
-    except Exception:
-        pass
+    safe_edit_message(
+        text,
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=file_control_keyboard(file_id)
+    )
 
 
 def _handle_owner_callbacks(call: CallbackQuery):
     data = call.data
 
     if data == "owner_panel":
-        bot.edit_message_text(
+        safe_edit_message(
             "👑 *Owner Administration Panel*\n━━━━━━━━━━━━━━━━━━━━\nFull control over server processes, user workspaces, security logs, and database records:",
             call.message.chat.id,
             call.message.message_id,
@@ -1007,7 +1266,7 @@ def _handle_owner_callbacks(call: CallbackQuery):
             f"• Blocked Malicious Uploads: `{stats.get('blocked_malicious_files', 0)}`\n"
             f"• Total Pip Installs: `{stats.get('total_pip_installs', 0)}`"
         )
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=owner_panel_keyboard())
+        safe_edit_message(text, call.message.chat.id, call.message.message_id, reply_markup=owner_panel_keyboard())
 
     elif data == "owner_processes":
         sessions = db.get_all_sessions()
@@ -1024,9 +1283,9 @@ def _handle_owner_callbacks(call: CallbackQuery):
                 f"• `{f_rec['file_name']}` (`{fid}`) — User `{sess['user_id']}`\n"
                 f"  PID: `{m['pid']}` | CPU: `{m['cpu']}%` | RAM: `{m['ram_mb']} MB`"
             )
-            markup.add(InlineKeyboardButton(f"🛑 Kill {f_rec['file_name']} (User {sess['user_id']})", callback_data=f"owner_kill:{fid}"))
-        markup.add(InlineKeyboardButton("🔙 Owner Panel", callback_data="owner_panel"))
-        bot.edit_message_text("\n".join(lines), call.message.chat.id, call.message.message_id, reply_markup=markup)
+            markup.add(InlineKeyboardButton(f"🔴 🛑 Kill {f_rec['file_name']} (User {sess['user_id']})", callback_data=f"owner_kill:{fid}"))
+        markup.add(InlineKeyboardButton("🔵 🔙 Owner Panel", callback_data="owner_panel"))
+        safe_edit_message("\n".join(lines), call.message.chat.id, call.message.message_id, reply_markup=markup)
 
     elif data.startswith("owner_kill:"):
         fid = data.split(":", 1)[1]
@@ -1045,18 +1304,18 @@ def _handle_owner_callbacks(call: CallbackQuery):
         users = db.get_all_users()
         lines = ["👥 *Registered Users Directory*\n━━━━━━━━━━━━━━━━━━━━"]
         for uid, u in list(users.items())[:25]:
-            banned_flag = "🚫 BANNED" if db.is_banned(int(uid)) else "✅ ACTIVE"
+            banned_flag = "🔴 BANNED" if db.is_banned(int(uid)) else "🟢 ACTIVE"
             u_files = len(db.get_user_files(int(uid)))
             lines.append(f"• `{uid}` (@{u.get('username')}) — `{u_files}` projects [{banned_flag}]")
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Owner Panel", callback_data="owner_panel"))
-        bot.edit_message_text("\n".join(lines), call.message.chat.id, call.message.message_id, reply_markup=markup)
+        markup.add(InlineKeyboardButton("🔵 🔙 Owner Panel", callback_data="owner_panel"))
+        safe_edit_message("\n".join(lines), call.message.chat.id, call.message.message_id, reply_markup=markup)
 
     elif data == "owner_ban_prompt":
         db.set_user_state(call.from_user.id, "OWNER_AWAITING_BAN")
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="owner_panel"))
-        bot.edit_message_text(
+        markup.add(InlineKeyboardButton("🔴 🔙 Cancel", callback_data="owner_panel"))
+        safe_edit_message(
             "🚫 *Ban / Unban User*\n━━━━━━━━━━━━━━━━━━━━\nSend the numeric Telegram User ID to toggle their ban status and kill their active processes:",
             call.message.chat.id,
             call.message.message_id,
@@ -1066,23 +1325,119 @@ def _handle_owner_callbacks(call: CallbackQuery):
     elif data == "owner_broadcast":
         db.set_user_state(call.from_user.id, "OWNER_AWAITING_BROADCAST")
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Cancel", callback_data="owner_panel"))
-        bot.edit_message_text(
+        markup.add(InlineKeyboardButton("🔴 🔙 Cancel", callback_data="owner_panel"))
+        safe_edit_message(
             "📢 *Global Broadcast*\n━━━━━━━━━━━━━━━━━━━━\nSend the message text you want to broadcast to all registered users:",
             call.message.chat.id,
             call.message.message_id,
             reply_markup=markup
         )
 
+    elif data == "owner_download_all_files":
+        bot.answer_callback_query(call.id, "📦 Archiving all user files & perma data...")
+        sync_to_perma_data(call.from_user)
+        zip_path = "all_hosted_files_and_perma_backup.zip"
+        try:
+            from config import DB_FILE_PATH
+        except Exception:
+            DB_FILE_PATH = "database.json"
+
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            if os.path.exists(PERMA_DATA_FILE):
+                zf.write(PERMA_DATA_FILE, arcname=PERMA_DATA_FILE)
+            if os.path.exists(DB_FILE_PATH):
+                zf.write(DB_FILE_PATH, arcname=os.path.basename(DB_FILE_PATH))
+
+            added_paths = set()
+            # Archive all user workspaces
+            for uid in db.get_all_users().keys():
+                try:
+                    ws_dir = pm.get_user_workspace(int(uid))
+                    if os.path.exists(ws_dir):
+                        for root, _, files_list in os.walk(ws_dir):
+                            for f_item in files_list:
+                                full_p = os.path.abspath(os.path.join(root, f_item))
+                                if full_p not in added_paths:
+                                    added_paths.add(full_p)
+                                    zf.write(full_p, arcname=os.path.relpath(full_p, "."))
+                except Exception:
+                    pass
+
+            # Also ensure any standalone file paths registered in DB are included
+            for f_rec in db.get_all_files().values():
+                f_path = f_rec.get("file_path")
+                if f_path and os.path.exists(f_path):
+                    full_p = os.path.abspath(f_path)
+                    if full_p not in added_paths:
+                        added_paths.add(full_p)
+                        zf.write(full_p, arcname=os.path.relpath(full_p, "."))
+
+        with open(zip_path, "rb") as f_doc:
+            bot.send_document(
+                call.message.chat.id,
+                f_doc,
+                caption="🟢 📦 *Full System Files & Perma Data Backup*\nIncludes all user scripts, workspaces, `database.json`, and `perma_data.json`."
+            )
+        try:
+            os.remove(zip_path)
+        except Exception:
+            pass
+
+    elif data == "owner_set_media":
+        db.set_user_state(call.from_user.id, "OWNER_AWAITING_MEDIA")
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("🔴 🗑️ Remove Current Media", callback_data="owner_clear_media"),
+            InlineKeyboardButton("🔵 🔙 Cancel", callback_data="owner_panel")
+        )
+        safe_edit_message(
+            "🎬 *Set Upper Menu Video or Photo*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Send any **Video (MP4)** or **Photo** directly in chat now:\n\n"
+            "• If you upload a **Video**, users will see it at the top of the `/start` menu with **volume ON**.\n"
+            "• If you upload a **Photo**, users will see the photo frame instead.",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+
+    elif data == "owner_clear_media":
+        pdata = load_perma_data()
+        pdata["menu_media"] = {"type": None, "file_id": None}
+        save_perma_data(pdata)
+        db.set_user_state(call.from_user.id, "IDLE")
+        bot.answer_callback_query(call.id, "🗑️ Upper menu media cleared!", show_alert=True)
+        call.data = "owner_panel"
+        _handle_owner_callbacks(call)
+
+    elif data == "owner_restore_perma":
+        db.set_user_state(call.from_user.id, "OWNER_AWAITING_PERMA_RESTORE")
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🔴 🔙 Cancel", callback_data="owner_panel"))
+        safe_edit_message(
+            "🔄 *Restore Perma Data / Full System Backup*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Upload your `perma_data.json` or `all_hosted_files_and_perma_backup.zip` file in chat now.\n"
+            "All user records, settings, and workspaces will be automatically restored on this system.",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup
+        )
+
     elif data == "owner_export_db":
+        sync_to_perma_data(call.from_user)
         from config import DB_FILE_PATH
         if os.path.exists(DB_FILE_PATH):
             with open(DB_FILE_PATH, "rb") as f:
                 bot.send_document(call.message.chat.id, f, caption="💾 *Live Snapshot of `database.json`*")
-        bot.answer_callback_query(call.id, "Database exported!")
+        if os.path.exists(PERMA_DATA_FILE):
+            with open(PERMA_DATA_FILE, "rb") as pf:
+                bot.send_document(call.message.chat.id, pf, caption="🟢 💾 *Live Snapshot of `perma_data.json`*")
+        bot.answer_callback_query(call.id, "Database & Perma Data exported!")
 
 
 if __name__ == "__main__":
+    auto_sync_perma_on_boot()
     print("====================================================")
     print("🚀 Telegram Cloud Hoster Bot (Docker + ZIP Ready)!")
     print(f"👑 Owner ID configured as: {OWNER_ID}")
