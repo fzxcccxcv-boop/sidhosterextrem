@@ -354,7 +354,7 @@ def _send_welcome_card(message: Message):
         full_name += f" {user.last_name}"
 
     caption = (
-        f"🎉 *Welcome to Cloud Python Hoster!*\n"
+        f"🎉 *Welcome to Sid Python Hoster!*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 *Name:* `{full_name}`\n"
         f"🔗 *Username:* `{username}`\n"
@@ -424,7 +424,7 @@ def cmd_start(message: Message):
     active_sessions = db.get_user_sessions(user_id)
 
     welcome_text = (
-        f"⚡ *Cloud Python Hoster & Terminal Bot*\n"
+        f"⚡ *Sid Python Hoster & Terminal Bot*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 *User:* `{message.from_user.first_name}` (`{user_id}`)\n"
         f"📁 *Hosted Projects:* `{len(user_files)}/{MAX_FILES_PER_USER}`\n"
@@ -518,7 +518,7 @@ def handle_welcome_media(message: Message):
     _set_global("welcome_media", {
         "type": media_type,
         "file_id": file_id,
-        "caption": "Welcome to Cloud Python Hoster!"
+        "caption": "Welcome to Sid Python Hoster!"
     })
     db.set_user_state(user_id, "IDLE")
     bot.reply_to(
@@ -1003,7 +1003,7 @@ def handle_callbacks(call: CallbackQuery):
         user_files = db.get_user_files(user_id)
         active_sessions = db.get_user_sessions(user_id)
         bot.edit_message_text(
-            f"⚡ *Cloud Python Hoster Dashboard*\n"
+            f"⚡ *Sid Python Hoster Dashboard*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 *User ID:* `{user_id}`\n"
             f"📁 *Saved Projects:* `{len(user_files)}/{MAX_FILES_PER_USER}`\n"
@@ -1605,7 +1605,7 @@ def _handle_owner_callbacks(call: CallbackQuery):
 # ==========================================
 if __name__ == "__main__":
     print("====================================================")
-    print("🚀 Telegram Cloud Hoster Bot (Docker + ZIP Ready)!")
+    print("🚀 Telegram Sid Hoster Bot (Docker + ZIP Ready)!")
     print(f"👑 Owner ID configured as: {OWNER_ID}")
     print(f"🔧 Antibackup: {'ACTIVE' if is_system_active() else 'MAINTENANCE MODE'}")
     print(f"💾 Perma file: {PERMA_FILE} ({'present' if os.path.exists(PERMA_FILE) else 'not yet created'})")
