@@ -5,9 +5,7 @@ import os
 # ==========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "'8964561893:AAEdqAJuJ2kxrfuwLeXrpbtKa3psxaJnt3o")
 OWNER_ID = int(os.getenv("OWNER_ID", "8976761358"))  # Replace with your Telegram User ID
-ADMIN_IDS =8684812026
-YOUR_USERNAME = '@Kengofaws'
-UPDATE_CHANNEL = '@cudaipurog'
+ADMIN_IDS = [8684812026]
 
 # ==========================================
 # PATHS & WORKSPACE SETTINGS
