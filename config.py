@@ -4,7 +4,7 @@ import os
 # TELEGRAM BOT & ADMIN CONFIGURATION
 # ==========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9081419823:AAFPDocOaSUO-VyU_BhDmc2j0HUgNto2hAE")
-OWNER_ID = int(os.getenv("OWNER_ID", "8976761358"))  # Replace with your Telegram User ID
+OWNER_ID = int(os.getenv("OWNER_ID", "8684812026"))  # Replace with your Telegram User ID
 ADMIN_IDS = [OWNER_ID]
 
 # ==========================================
