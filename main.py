@@ -6,6 +6,7 @@ import shutil
 import zipfile
 import io
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import psutil
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
@@ -26,6 +27,68 @@ bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
 
 # ==========================================
+# OWNER / ADMIN ID NORMALIZATION
+# ==========================================
+def _build_admin_set(owner_id, admin_ids) -> set[int]:
+    """Ensure OWNER_ID and ADMIN_IDS (int, str, or list) are all resolved as int IDs."""
+    resolved = set()
+    if owner_id is not None:
+        for part in str(owner_id).split(","):
+            part = part.strip()
+            if part.lstrip("-").isdigit():
+                resolved.add(int(part))
+
+    if admin_ids is not None:
+        items = admin_ids if isinstance(admin_ids, (list, tuple, set)) else str(admin_ids).split(",")
+        for item in items:
+            s = str(item).strip()
+            if s.lstrip("-").isdigit():
+                resolved.add(int(s))
+    return resolved
+
+
+RESOLVED_ADMIN_IDS = _build_admin_set(OWNER_ID, ADMIN_IDS)
+
+
+def is_admin(user_id: int) -> bool:
+    """Return True if user_id matches OWNER_ID or any ID in ADMIN_IDS."""
+    try:
+        return int(user_id) in RESOLVED_ADMIN_IDS
+    except (TypeError, ValueError):
+        return False
+
+
+# ==========================================
+# RENDER KEEP-ALIVE HTTP SERVER (PORT)
+# ==========================================
+class _HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK - Sid Python Hoster Bot is running")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # Suppress routine health-check access logs
+
+
+class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+def start_health_server() -> int:
+    """Bind to Render's PORT environment variable so web service deployment stays alive."""
+    port = int(os.environ.get("PORT", 8080))
+    server = _ReusableThreadingHTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return port
+
+
+# ==========================================
 # ANTIBACKUP / MAINTENANCE MODE
 # ==========================================
 MAINTENANCE_KEY_FILE = "antibackup.key"
@@ -39,7 +102,7 @@ def is_system_active() -> bool:
 def _maintenance_reject(message_or_call, is_call: bool = False) -> bool:
     """Return True if the action should be blocked (maintenance message shown)."""
     user_id = message_or_call.from_user.id
-    if user_id in ADMIN_IDS:
+    if is_admin(user_id):
         return False          # Owner always has access
     if is_system_active():
         return False          # Active — user can proceed
@@ -265,7 +328,7 @@ def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
         btn("💻 Terminal (Pip)", "menu_terminal", "primary"),
         btn("⚙️ Settings & Env", "menu_settings", "primary"),
     )
-    if user_id in ADMIN_IDS:
+    if is_admin(user_id):
         markup.add(btn("👑 Owner Control Panel", "owner_panel", "danger"))
     return markup
 
@@ -406,7 +469,7 @@ def cmd_start(message: Message):
         return
 
     user_id = message.from_user.id
-    if db.is_banned(user_id):
+    if not is_admin(user_id) and db.is_banned(user_id):
         bot.reply_to(message, "🚫 *Access Denied:* Your account has been suspended by the administrator.")
         return
 
@@ -444,7 +507,7 @@ def cmd_terminal(message: Message):
     if _maintenance_reject(message):
         return
     user_id = message.from_user.id
-    if db.is_banned(user_id):
+    if not is_admin(user_id) and db.is_banned(user_id):
         return
     db.set_user_state(user_id, "TERMINAL_PIP")
     markup = InlineKeyboardMarkup()
@@ -467,7 +530,7 @@ def cmd_autohost(message: Message):
     if _maintenance_reject(message):
         return
     user_id = message.from_user.id
-    if db.is_banned(user_id):
+    if not is_admin(user_id) and db.is_banned(user_id):
         return
     db.set_user_state(user_id, "AWAITING_GITHUB_URL")
     markup = InlineKeyboardMarkup()
@@ -484,7 +547,7 @@ def cmd_autohost(message: Message):
 
 @bot.message_handler(commands=["owner"])
 def cmd_owner(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
+    if not is_admin(message.from_user.id):
         bot.reply_to(message, "⛔ *Unauthorized:* Owner privileges required.")
         return
     bot.send_message(
@@ -502,7 +565,7 @@ def cmd_owner(message: Message):
 @bot.message_handler(content_types=["photo", "video"])
 def handle_welcome_media(message: Message):
     user_id = message.from_user.id
-    if user_id not in ADMIN_IDS:
+    if not is_admin(user_id):
         return
     user = db.get_user(user_id) or {}
     if user.get("state") != "OWNER_AWAITING_WELCOME_MEDIA":
@@ -537,33 +600,36 @@ def handle_document_upload(message: Message):
         return
 
     user_id = message.from_user.id
-    if db.is_banned(user_id):
+    if not is_admin(user_id) and db.is_banned(user_id):
         bot.reply_to(message, "🚫 You are banned from using this hoster.")
         return
 
     db.register_user(user_id, message.from_user.username, message.from_user.first_name)
     doc = message.document
     file_name = doc.file_name or "script.py"
+    user_record = db.get_user(user_id) or {}
 
     # ═══════════════════════════════════════════════════════
     # SPECIAL: perma_data.json restore (Owner only)
     # ═══════════════════════════════════════════════════════
-    if user_id in ADMIN_IDS and file_name == "perma_data.json":
+    if is_admin(user_id) and (
+        user_record.get("state") == "OWNER_AWAITING_PERMA_UPLOAD"
+        or (file_name.lower().startswith("perma_data") and file_name.lower().endswith(".json"))
+    ):
+        db.set_user_state(user_id, "IDLE")
         _handle_perma_restore(message)
         return
 
     # ═══════════════════════════════════════════════════════
     # SPECIAL: Owner in welcome-media state → tell them to send as photo/video
     # ═══════════════════════════════════════════════════════
-    if user_id in ADMIN_IDS:
-        user = db.get_user(user_id) or {}
-        if user.get("state") == "OWNER_AWAITING_WELCOME_MEDIA":
-            bot.reply_to(
-                message,
-                "⚠️ Please send the welcome media as a *photo* or *video* message directly "
-                "(not as a file attachment), or tap Cancel.",
-            )
-            return
+    if is_admin(user_id) and user_record.get("state") == "OWNER_AWAITING_WELCOME_MEDIA":
+        bot.reply_to(
+            message,
+            "⚠️ Please send the welcome media as a *photo* or *video* message directly "
+            "(not as a file attachment), or tap Cancel.",
+        )
+        return
 
     if doc.file_size and doc.file_size > MAX_FILE_SIZE_MB * 1024 * 1024:
         bot.reply_to(message, f"❌ File exceeds maximum upload size limit of `{MAX_FILE_SIZE_MB} MB`.")
@@ -586,7 +652,7 @@ def handle_document_upload(message: Message):
         return
 
     user_files = db.get_user_files(user_id)
-    if len(user_files) >= MAX_FILES_PER_USER and user_id not in ADMIN_IDS:
+    if len(user_files) >= MAX_FILES_PER_USER and not is_admin(user_id):
         bot.reply_to(message, f"⚠️ Quota reached (`{MAX_FILES_PER_USER}` projects max). Delete an old file first.")
         return
 
@@ -644,7 +710,7 @@ def handle_document_upload(message: Message):
         mark_perma_dirty()
 
         active_sessions = db.get_user_sessions(user_id)
-        if len(active_sessions) < MAX_CONCURRENT_PROCESSES_PER_USER or user_id in ADMIN_IDS:
+        if len(active_sessions) < MAX_CONCURRENT_PROCESSES_PER_USER or is_admin(user_id):
             update_zip_progress(f"🚀 Launching `{display_name}` in real-time...")
             pm.start_file(file_id, on_crash_callback=notify_user_on_crash)
             time.sleep(2.5)
@@ -838,7 +904,7 @@ def handle_text_states(message: Message):
         return
 
     user_id = message.from_user.id
-    if db.is_banned(user_id):
+    if not is_admin(user_id) and db.is_banned(user_id):
         return
 
     user = db.register_user(user_id, message.from_user.username, message.from_user.first_name)
@@ -936,7 +1002,7 @@ def handle_text_states(message: Message):
         return
 
     # 3. OWNER BAN / UNBAN FLOW
-    if state == "OWNER_AWAITING_BAN" and user_id in ADMIN_IDS:
+    if state == "OWNER_AWAITING_BAN" and is_admin(user_id):
         db.set_user_state(user_id, "IDLE")
         try:
             target_id = int(text)
@@ -956,7 +1022,7 @@ def handle_text_states(message: Message):
         return
 
     # 4. OWNER BROADCAST FLOW
-    if state == "OWNER_AWAITING_BROADCAST" and user_id in ADMIN_IDS:
+    if state == "OWNER_AWAITING_BROADCAST" and is_admin(user_id):
         db.set_user_state(user_id, "IDLE")
         users = db.get_all_users()
         sent = 0
@@ -970,7 +1036,7 @@ def handle_text_states(message: Message):
         return
 
     # 5. OWNER in welcome-media state → hint
-    if state == "OWNER_AWAITING_WELCOME_MEDIA" and user_id in ADMIN_IDS:
+    if state == "OWNER_AWAITING_WELCOME_MEDIA" and is_admin(user_id):
         bot.reply_to(
             message,
             "🖼️ Please send a *photo* or a *video* (as media, not as a file), or tap Cancel in the panel."
@@ -990,7 +1056,7 @@ def handle_text_states(message: Message):
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call: CallbackQuery):
     user_id = call.from_user.id
-    if db.is_banned(user_id):
+    if not is_admin(user_id) and db.is_banned(user_id):
         bot.answer_callback_query(call.id, "🚫 Access denied.", show_alert=True)
         return
     if _maintenance_reject(call, is_call=True):
@@ -1213,7 +1279,7 @@ def handle_callbacks(call: CallbackQuery):
     elif data.startswith("file_start:"):
         fid = data.split(":", 1)[1]
         active = db.get_user_sessions(user_id)
-        if len(active) >= MAX_CONCURRENT_PROCESSES_PER_USER and user_id not in ADMIN_IDS:
+        if len(active) >= MAX_CONCURRENT_PROCESSES_PER_USER and not is_admin(user_id):
             bot.answer_callback_query(
                 call.id,
                 f"⚠️ Concurrent process limit ({MAX_CONCURRENT_PROCESSES_PER_USER}) reached. Stop another process first.",
@@ -1327,7 +1393,7 @@ def handle_callbacks(call: CallbackQuery):
         handle_callbacks(call)
 
     elif data.startswith("owner_"):
-        if user_id not in ADMIN_IDS:
+        if not is_admin(user_id):
             bot.answer_callback_query(call.id, "⛔ Owner only!", show_alert=True)
             return
         _handle_owner_callbacks(call)
@@ -1483,7 +1549,7 @@ def _handle_owner_callbacks(call: CallbackQuery):
                 bot.send_document(call.message.chat.id, f, caption="💾 *Live Snapshot of `database.json`*")
         bot.answer_callback_query(call.id, "Database exported!")
 
-    # ─────────── NEW: Download ALL user files as ZIP ───────────
+    # ─────────── Download ALL user files as ZIP ───────────
     elif data == "owner_download_all":
         bot.answer_callback_query(call.id, "Packaging all files…", show_alert=False)
         try:
@@ -1517,7 +1583,7 @@ def _handle_owner_callbacks(call: CallbackQuery):
         except Exception as e:
             bot.answer_callback_query(call.id, f"Packaging failed: {str(e)[:150]}", show_alert=True)
 
-    # ─────────── NEW: perma_data.json download ───────────
+    # ─────────── perma_data.json download ───────────
     elif data == "owner_download_perma":
         if os.path.exists(PERMA_FILE):
             _perma_sync_now()  # fresh snapshot before download
@@ -1542,7 +1608,7 @@ def _handle_owner_callbacks(call: CallbackQuery):
             else:
                 bot.answer_callback_query(call.id, "Could not generate perma_data.json (db.data not accessible).", show_alert=True)
 
-    # ─────────── NEW: perma_data.json upload prompt ───────────
+    # ─────────── perma_data.json upload prompt ───────────
     elif data == "owner_upload_perma":
         db.set_user_state(call.from_user.id, "OWNER_AWAITING_PERMA_UPLOAD")
         markup = InlineKeyboardMarkup()
@@ -1557,7 +1623,7 @@ def _handle_owner_callbacks(call: CallbackQuery):
             reply_markup=markup
         )
 
-    # ─────────── NEW: Welcome Media ───────────
+    # ─────────── Welcome Media ───────────
     elif data == "owner_set_welcome_media":
         db.set_user_state(call.from_user.id, "OWNER_AWAITING_WELCOME_MEDIA")
         markup = InlineKeyboardMarkup()
@@ -1580,7 +1646,7 @@ def _handle_owner_callbacks(call: CallbackQuery):
         call.data = "owner_panel"
         _handle_owner_callbacks(call)
 
-    # ─────────── NEW: Toggle Maintenance Mode ───────────
+    # ─────────── Toggle Maintenance Mode ───────────
     elif data == "owner_toggle_maintenance":
         if is_system_active():
             try:
@@ -1604,9 +1670,11 @@ def _handle_owner_callbacks(call: CallbackQuery):
 # STARTUP
 # ==========================================
 if __name__ == "__main__":
+    bound_port = start_health_server()
     print("====================================================")
-    print("🚀 Telegram Sid Hoster Bot (Docker + ZIP Ready)!")
-    print(f"👑 Owner ID configured as: {OWNER_ID}")
+    print("🚀 Telegram Sid Hoster Bot (Docker + ZIP + Render Ready)!")
+    print(f"🌐 Health Check HTTP Server listening on port: {bound_port}")
+    print(f"👑 Owner ID configured as: {OWNER_ID} | Resolved Admins: {sorted(RESOLVED_ADMIN_IDS)}")
     print(f"🔧 Antibackup: {'ACTIVE' if is_system_active() else 'MAINTENANCE MODE'}")
     print(f"💾 Perma file: {PERMA_FILE} ({'present' if os.path.exists(PERMA_FILE) else 'not yet created'})")
     print("====================================================")
